@@ -1,0 +1,90 @@
+# Decision log
+
+Technical choices made while building EvidenceDesk, and the simpler alternative considered for each.
+
+## Storage: SQLite + embedded Chroma instead of PostgreSQL + Docker Compose
+
+**Chosen:** SQLite (via SQLAlchemy) for metadata, and Chroma running in embedded/persistent
+mode (a plain Python library, no server process) for vectors.
+
+**Why not the recommended stack:** Docker Desktop was not installed/running on the
+development machine (`docker ps` failed to reach the daemon), and free disk space was
+limited (~43GB at the start of the build). Rather than install Docker Desktop
+(a global software change requiring consent) or block the whole project, a documented
+local fallback was used, per the task's own instructions for this situation.
+
+**Trade-off:** SQLite is single-writer and not meant for concurrent multi-user access;
+fine for a single-user local prototype. Alembic was included in requirements but
+migrations were not set up — the schema is created with `Base.metadata.create_all()`
+at startup, which is adequate for a prototype with no production deployment yet. If
+this moves to Postgres later, swapping `DATABASE_URL` is the only required change
+(SQLAlchemy models are not SQLite-specific), and Alembic migrations should be added
+at that point.
+
+## Embedding + chat model: Ollama only, no hosted provider implemented
+
+**Chosen:** `nomic-embed-text` (274MB) for embeddings and the already-installed
+`qwen2.5:7b` for generation/judging, both served locally via Ollama.
+
+**Why:** The task requires the basic prototype to never need a paid API, and an
+optional hosted provider must not be invented without a verified integration. A
+`hosted_provider_enabled` config flag and provider-abstraction seam exist in
+`app/llm_client.py` for a future hosted provider, but no hosted call is implemented —
+doing so without a real, tested account/key would mean inventing capabilities, which
+the task explicitly disallows.
+
+## Reranker: optional cross-encoder, lazily loaded, falls back gracefully
+
+**Chosen:** `cross-encoder/ms-marco-MiniLM-L-6-v2` via `sentence-transformers`,
+loaded only when `hybrid_rerank` mode is used, with the model load wrapped so a
+missing/failed load falls back to the unranked hybrid order instead of crashing.
+
+**Why not skip it entirely:** CPU inference is fine for a ~70MB cross-encoder; it
+was feasible on this machine (24-core CPU, no GPU requirement) and disk headroom
+was enough (~2GB for torch CPU wheels) within the measured 43GB free budget. It
+stays optional: `settings.reranker_enabled` gates whether `hybrid_rerank` mode
+attempts to load/run the cross-encoder at all (`app/retrieval.py` checks
+`reranker.is_enabled()` before calling it), and even when enabled, a failed model
+load falls back to the unranked hybrid order rather than crashing the request.
+
+## LangGraph: not used
+
+**Chosen:** plain Python functions implement the single conditional retry-then-refuse
+branch in `app/generation.py`.
+
+**Why:** The task says to use LangGraph only if the workflow actually benefits from
+it. The control flow here is one linear pipeline with exactly one bounded retry — a
+few `if`/`for` statements express this more simply and more testably than a graph
+framework would, and introducing LangGraph here would be decoration, not benefit.
+
+## Retrieval-only vs. full-pipeline evaluation scope
+
+**Chosen:** Recall@k/MRR are computed for all four retrieval modes (vector, keyword,
+hybrid, hybrid+rerank) because each only costs one embedding call per question.
+Citation precision/recall, refusal accuracy, verification-outcome counts, and
+latency are computed only for the single *primary* configured mode, because each
+case in that measurement costs at least one local LLM generation call, plus up to
+one retry, plus one semantic-judge call per claim — multiplying that by 4 modes
+would multiply local CPU inference time with no new information about retrieval
+quality specifically (which the first set of metrics already isolates).
+
+**Why this is reported, not hidden:** the evaluation report explicitly labels which
+metrics are mode-by-mode vs. primary-mode-only, so the scoping is visible rather than
+silently narrowing "compare retrieval configurations" to only the headline numbers.
+
+## Evaluation dataset: synthetic sample documents, author-labelled
+
+**Chosen:** Three short synthetic study-note PDFs (operating systems, database
+systems, cell biology), generated programmatically with one topic per page, with
+54 hand-authored question/expected-evidence pairs across answerable (single- and
+multi-passage), near-duplicate-vocabulary "distractor," and unanswerable categories.
+
+**Why not real course material:** the task prohibits including private course
+documents in a shared project without permission, and no public, rights-cleared
+corpus with verified page-level ground truth was available to pull in in this
+session without risking a copyright/licensing mistake. Because the documents were
+generated by the same process that wrote the dataset, the expected-evidence page
+numbers are correct by construction rather than asserted after the fact — but this
+also means the dataset doesn't exercise messy real-world PDF layouts (multi-column
+text, scanned headers, footnotes), which is a real limitation, documented in the
+README's Known Limitations section.
